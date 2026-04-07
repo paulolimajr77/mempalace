@@ -1,0 +1,15 @@
+// Ref: https://github.com/DavidAnson/markdownlint/blob/main/schema/.markdownlint.jsonc
+{
+  "MD013": {
+    // Default: 80
+    "line_length": 120,
+    // Ignore long lines in code blocks
+    "code_blocks": false,
+    // Tables with many columns routinely exceed line limits; exempt them
+    "tables": false
+  },
+  "MD024": {
+    // Allow duplicate headings under different parent headings (e.g. CHANGELOG sections)
+    "siblings_only": true
+  }
+}

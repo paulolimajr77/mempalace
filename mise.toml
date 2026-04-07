@@ -1,0 +1,19 @@
+# https://mise.jdx.dev/
+[settings]
+experimental = true
+install_before = "7d"
+npm.package_manager = "bun"
+
+[tools]
+"npm:markdownlint-cli" = "0.48"
+
+bun = "1"
+gh = "2"
+hk = "1.41.0"
+node = "24"
+pkl = "0.31"
+taplo = "0.10"
+usage = "latest"
+
+[hooks]
+enter = ["hk install --mise"]

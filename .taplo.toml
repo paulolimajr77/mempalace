@@ -1,0 +1,13 @@
+# Taplo configuration for TOML formatting
+# https://taplo.tamasfe.dev/configuration/file.html
+
+# Global formatting options - don't reorder keys by default
+[formatting]
+reorder_keys = false
+
+# Only reorder keys in the [tools] and [env] sections
+[[rule]]
+keys = ["env", "tools"]
+
+[rule.formatting]
+reorder_keys = true

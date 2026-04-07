@@ -1,0 +1,206 @@
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
+use turso::Connection;
+
+use crate::config::ProjectConfig;
+use crate::error::Result;
+use crate::palace::chunker::chunk_text;
+use crate::palace::drawer;
+use crate::palace::room_detect::{detect_room, is_skip_dir};
+
+/// Options shared by `mine` and `mine_convos`.
+pub struct MineParams {
+    /// Override the wing name; `None` falls back to config / directory name.
+    pub wing: Option<String>,
+    /// Agent name recorded on each drawer.
+    pub agent: String,
+    /// Maximum files to process; `0` means unlimited.
+    pub limit: usize,
+    /// If `true`, show what would be filed without writing to the palace.
+    pub dry_run: bool,
+}
+
+const READABLE_EXTENSIONS: &[&str] = &[
+    "txt", "md", "py", "js", "ts", "jsx", "tsx", "json", "yaml", "yml", "html", "css", "java",
+    "go", "rs", "rb", "sh", "csv", "sql", "toml", "c", "cpp", "h", "hpp", "swift", "kt", "scala",
+    "lua", "r", "php", "pl", "zig", "nim", "ex", "exs", "erl", "hs", "ml",
+];
+
+const SKIP_FILES: &[&str] = &[
+    "mempalace.yaml",
+    "mempalace.yml",
+    "mempal.yaml",
+    "mempal.yml",
+    ".gitignore",
+    "package-lock.json",
+    "Cargo.lock",
+];
+
+/// Scan a project directory for all readable files.
+pub fn scan_project(project_dir: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    walk_dir(project_dir, &mut files);
+    files
+}
+
+fn walk_dir(dir: &Path, files: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+
+        if path.is_dir() {
+            if !is_skip_dir(&name) {
+                walk_dir(&path, files);
+            }
+        } else if let Some(ext) = path.extension() {
+            let ext_lower = ext.to_string_lossy().to_lowercase();
+            if READABLE_EXTENSIONS.contains(&ext_lower.as_str())
+                && !SKIP_FILES.contains(&name.as_str())
+            {
+                files.push(path);
+            }
+        }
+    }
+}
+
+/// Mine a project directory into the palace.
+// Single-pass file mining pipeline; dry_run and limit handling adds lines but splitting
+// would fragment shared state (counts, room_counts) across functions artificially.
+#[allow(clippy::too_many_lines)]
+pub async fn mine(conn: &Connection, project_dir: &Path, opts: &MineParams) -> Result<()> {
+    let project_dir = project_dir.canonicalize().map_err(|e| {
+        crate::error::Error::Other(format!(
+            "directory not found: {}: {e}",
+            project_dir.display()
+        ))
+    })?;
+
+    let config_path = project_dir.join("mempalace.yaml");
+    let config = ProjectConfig::load(&config_path)?;
+
+    let wing = opts.wing.as_deref().unwrap_or(&config.wing);
+    let rooms = &config.rooms;
+    let all_files = scan_project(&project_dir);
+    let files: Vec<_> = if opts.limit == 0 {
+        all_files
+    } else {
+        all_files.into_iter().take(opts.limit).collect()
+    };
+
+    println!("\n=======================================================");
+    if opts.dry_run {
+        println!("  MemPalace Mine [DRY RUN]");
+    } else {
+        println!("  MemPalace Mine");
+    }
+    println!("=======================================================");
+    println!("  Wing:    {wing}");
+    println!(
+        "  Rooms:   {}",
+        rooms
+            .iter()
+            .map(|r| r.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    println!("  Files:   {}", files.len());
+    println!("-------------------------------------------------------\n");
+
+    let mut total_drawers: usize = 0;
+    let mut files_skipped: usize = 0;
+    let mut room_counts: HashMap<String, usize> = HashMap::new();
+
+    for (i, filepath) in files.iter().enumerate() {
+        let source_file = filepath.to_string_lossy().to_string();
+
+        if !opts.dry_run && drawer::file_already_mined(conn, &source_file).await? {
+            files_skipped += 1;
+            continue;
+        }
+
+        let content = match std::fs::read_to_string(filepath) {
+            Ok(c) => c,
+            Err(_) => match std::fs::read(filepath) {
+                Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
+                Err(_) => continue,
+            },
+        };
+
+        let content = content.trim().to_string();
+        if content.len() < 50 {
+            continue;
+        }
+
+        let room = detect_room(filepath, &content, rooms, &project_dir);
+        let chunks = chunk_text(&content);
+        let drawers_added = chunks.len();
+
+        if !opts.dry_run {
+            for chunk in &chunks {
+                let id = format!(
+                    "drawer_{wing}_{room}_{}",
+                    &uuid::Uuid::new_v4().to_string().replace('-', "")[..16]
+                );
+                drawer::add_drawer(
+                    conn,
+                    &drawer::DrawerParams {
+                        id: &id,
+                        wing,
+                        room: &room,
+                        content: &chunk.content,
+                        source_file: &source_file,
+                        chunk_index: chunk.chunk_index,
+                        added_by: &opts.agent,
+                        ingest_mode: "projects",
+                    },
+                )
+                .await?;
+            }
+        }
+
+        total_drawers += drawers_added;
+        *room_counts.entry(room.clone()).or_insert(0) += 1;
+        println!(
+            "  [{:4}/{}] {:50} +{drawers_added}",
+            i + 1,
+            files.len(),
+            filepath.file_name().unwrap_or_default().to_string_lossy(),
+        );
+    }
+
+    println!("\n=======================================================");
+    if opts.dry_run {
+        println!("  Dry run complete — nothing was written.");
+    } else {
+        println!("  Done.");
+    }
+    let files_processed = files.len() - files_skipped;
+    println!("  Files processed: {files_processed}");
+    println!("  Files skipped (already filed): {files_skipped}");
+    println!(
+        "  Drawers {}: {total_drawers}",
+        if opts.dry_run {
+            "would be filed"
+        } else {
+            "filed"
+        }
+    );
+    println!("\n  By room:");
+
+    let mut sorted_rooms: Vec<_> = room_counts.iter().collect();
+    sorted_rooms.sort_by(|a, b| b.1.cmp(a.1));
+    for (room, count) in sorted_rooms {
+        println!("    {room:20} {count} files");
+    }
+    if !opts.dry_run {
+        println!("\n  Next: mempalace search \"what you're looking for\"");
+    }
+    println!("=======================================================\n");
+
+    Ok(())
+}

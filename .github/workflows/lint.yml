@@ -1,0 +1,36 @@
+name: Lint
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+
+permissions: {}
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-24.04
+
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Setup Mise
+        uses: jdx/mise-action@1648a7812b9aeae629881980618f079932869151 # v4.0.1
+        env:
+          MISE_JOBS: 4
+        with:
+          cache_key_prefix: mise-lint
+          cache: true
+          experimental: true
+          install: true
+          version: ${{ env.MISE_VERISON }}
+
+      - run: hk check --all --skip-step no_commit_protected_branch
