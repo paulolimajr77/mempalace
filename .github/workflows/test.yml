@@ -7,10 +7,21 @@ permissions: {}
 
 jobs:
   run:
-    runs-on: ubuntu-24.04
+    runs-on: ${{ matrix.runs-on }}
 
     permissions:
       contents: read
+
+    strategy:
+      matrix:
+        runs-on: [ubuntu-24.04, ubuntu-24.04-arm, macos-26]
+        include:
+          - runs-on: ubuntu-24.04
+            arch: x86-64
+          - runs-on: ubuntu-24.04-arm
+            arch: arm64
+          - runs-on: macos-26
+            arch: arm64
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -25,7 +36,7 @@ jobs:
 
       - name: Capture rustc fingerprint
         id: rustc
-        run: echo "fingerprint=$(rustc -Vv | sha256sum | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+        run: echo "fingerprint=$(rustc -Vv | shasum -a 256 | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
 
       - name: Setup Mise
         uses: jdx/mise-action@1648a7812b9aeae629881980618f079932869151 # v4.0.1
@@ -43,24 +54,28 @@ jobs:
           path: |
             ~/.cargo
             target
-          key: ${{ runner.os }}-cargo-test-${{ steps.rustc.outputs.fingerprint }}-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-test-${{ matrix.arch }}-${{ steps.rustc.outputs.fingerprint }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-test-
+            ${{ runner.os }}-cargo-test-${{ matrix.arch }}-
 
       - name: Install Binstall
         env:
           BINSTALL_VERSION: v1.17.9 # https://github.com/cargo-bins/cargo-binstall/releases/latest
           BINSTALL_SHA: c2e963fbab3bdd8653b59c28d349bf85740cf4998e5e398d250dcd2884cd667d
+          GH_TOKEN: ${{ github.token }}
         run: |
           commit_sha=$(curl -fsSL --proto '=https' --tlsv1.2 \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
             "https://api.github.com/repos/cargo-bins/cargo-binstall/git/ref/tags/${BINSTALL_VERSION}" \
             | jq -r '.object.sha')
           curl -fsSL --proto '=https' --tlsv1.2 \
             "https://raw.githubusercontent.com/cargo-bins/cargo-binstall/${commit_sha}/install-from-binstall-release.sh" \
             -o /tmp/binstall-install.sh
-          echo "${BINSTALL_SHA}  /tmp/binstall-install.sh" | sha256sum --check
+          echo "${BINSTALL_SHA}  /tmp/binstall-install.sh" | shasum -a 256 --check
           bash /tmp/binstall-install.sh
       - name: Install Nextest
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: cargo binstall -y --force cargo-nextest cargo-llvm-cov
 
       - run: cargo nextest run
