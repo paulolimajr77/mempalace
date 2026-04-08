@@ -11,19 +11,10 @@ use crate::error::Result;
 /// For file-backed databases, WAL journal mode is enabled for better concurrency
 /// and crash recovery when multiple MCP clients write simultaneously.
 /// In-memory databases skip the WAL pragma since it is not applicable.
-#[allow(unsafe_code)]
+///
+/// Callers are expected to have set `LIMBO_DISABLE_FILE_LOCK` before the Tokio
+/// runtime starts (see `main()`).
 pub async fn open_db(path: &str) -> Result<(Database, Connection)> {
-    // Disable turso/limbo's exclusive file lock so multiple processes (e.g.
-    // concurrent MCP servers or CLI commands) can access the same database.
-    // WAL mode provides the necessary concurrency control at the protocol level.
-    // See: https://github.com/bunkerlab-net/mempalace/issues/9
-    //
-    // SAFETY: set_var is unsafe due to thread-safety concerns, but this runs
-    // before any other threads access the environment.
-    unsafe {
-        std::env::set_var("LIMBO_DISABLE_FILE_LOCK", "1");
-    }
-
     let db = Builder::new_local(path)
         .experimental_triggers(true)
         .build()

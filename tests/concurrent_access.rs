@@ -1,3 +1,26 @@
+// NOTE: This is a binary crate (no `[lib]` target), so integration tests
+// cannot import `db::open_db` directly. The helpers below replicate its
+// setup (experimental_triggers, WAL pragma, busy_timeout) so the same
+// production code path is exercised without duplicating the logic.
+
+async fn open_db_setup(path_str: &str) -> (turso::Database, turso::Connection) {
+    use std::time::Duration;
+    let db = turso::Builder::new_local(path_str)
+        .experimental_triggers(true)
+        .build()
+        .await
+        .expect("db open failed");
+    let conn = db.connect().expect("connect failed");
+    let mut rows = conn
+        .query("PRAGMA journal_mode=WAL", ())
+        .await
+        .expect("WAL pragma failed");
+    while rows.next().await.expect("row error").is_some() {}
+    conn.busy_timeout(Duration::from_secs(5))
+        .expect("busy_timeout failed");
+    (db, conn)
+}
+
 /// Verify that multiple processes can open the same database file concurrently
 /// when `LIMBO_DISABLE_FILE_LOCK` is set. Regression test for
 /// <https://github.com/bunkerlab-net/mempalace/issues/9>
@@ -8,22 +31,16 @@ async fn two_connections_to_same_file() {
     let db_path = dir.path().join("palace.db");
     let path_str = db_path.to_str().expect("non-utf8 path");
 
-    // Disable turso's exclusive file lock (same as open_db does at runtime).
+    // In production, main() sets this before the Tokio runtime starts.
+    // Replicate that here since tests have no main().
     unsafe {
         std::env::set_var("LIMBO_DISABLE_FILE_LOCK", "1");
     }
 
     // First "process" opens the database and holds the connection.
-    let db1 = turso::Builder::new_local(path_str)
-        .build()
-        .await
-        .expect("first open failed");
-    let conn1 = db1.connect().expect("first connect failed");
-    let mut rows = conn1
-        .query("PRAGMA journal_mode=WAL", ())
-        .await
-        .expect("WAL pragma failed");
-    while rows.next().await.expect("row error").is_some() {}
+    let (db1, conn1) = open_db_setup(path_str).await;
+    // Keep db1 alive so the lock stays held for the duration of the test.
+    let _db1 = db1;
 
     conn1
         .execute(
@@ -34,11 +51,7 @@ async fn two_connections_to_same_file() {
         .expect("create table failed");
 
     // Second "process" opens the same file — this would fail without the fix.
-    let db2 = turso::Builder::new_local(path_str)
-        .build()
-        .await
-        .expect("second open failed — file lock not disabled?");
-    let conn2 = db2.connect().expect("second connect failed");
+    let (_db2, conn2) = open_db_setup(path_str).await;
 
     conn2
         .execute(
