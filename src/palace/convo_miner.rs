@@ -12,8 +12,17 @@ use crate::palace::room_detect::is_skip_dir;
 
 const CONVO_EXTENSIONS: &[&str] = &["txt", "md", "json", "jsonl"];
 const MIN_CHUNK_SIZE: usize = 30;
+/// Bytes per drawer — large exchanges are split at this boundary (rounded down
+/// to a UTF-8 char boundary) so the full AI response is stored without
+/// truncation.  Mirrors miner.py's `CHUNK_SIZE`.  Uses `content.len()` (bytes),
+/// not `content.chars().count()`, so chunks may be slightly shorter for
+/// multi-byte characters.
+const CHUNK_SIZE: usize = 800;
 /// Files larger than this are skipped — prevents OOM on huge files.
 const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024; // 10 MB
+
+// Compile-time invariant: chunk size must be greater than min chunk size.
+const _: () = assert!(CHUNK_SIZE > MIN_CHUNK_SIZE);
 
 use super::WALK_DEPTH_LIMIT;
 
@@ -121,13 +130,50 @@ fn chunk_exchanges(content: &str) -> Vec<Chunk> {
         .filter(|l| l.trim_start().starts_with('>'))
         .count();
 
-    if quote_count >= 3 {
+    // Route to chunk_by_exchange only when the first non-empty line is a user
+    // turn marker ('>').  A previous version routed whenever quote_count >= 1,
+    // but chunk_by_exchange silently drops every non-'>' line via its else-skip
+    // branch.  Content that starts with unquoted preamble (leading text before
+    // the first '>') would therefore be discarded; chunk_by_paragraph preserves
+    // it instead.  The quote_count >= 1 guard still rejects fully unquoted files.
+    let first_nonempty_is_quote = lines
+        .iter()
+        .find(|l| !l.trim().is_empty())
+        .is_some_and(|l| l.trim_start().starts_with('>'));
+
+    if quote_count >= 1 && first_nonempty_is_quote {
         chunk_by_exchange(&lines)
     } else {
         chunk_by_paragraph(content)
     }
 }
 
+/// Return the largest byte index ≤ `index` that is a UTF‑8 char boundary in `s`.
+///
+/// Slicing `s` by a raw byte offset is unsafe when the string contains multi‑byte
+/// characters (emoji, accented letters, CJK) because the offset may land mid‑
+/// codepoint, causing a panic.  This function walks backwards from `index` until
+/// it finds a valid boundary, guaranteeing `&s[..result]` never panics.
+fn chunk_by_exchange_floor_char_boundary(s: &str, index: usize) -> usize {
+    if index >= s.len() {
+        return s.len();
+    }
+    let mut i = index;
+    while !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    // Postcondition: i is a valid char boundary within s.
+    debug_assert!(s.is_char_boundary(i));
+    debug_assert!(i <= index);
+    i
+}
+
+/// One user turn (>) + the full AI response that follows = one or more chunks.
+///
+/// Each line is whitespace-trimmed and empty lines are dropped; the remaining
+/// lines are joined with a single space.  When the combined content exceeds
+/// `CHUNK_SIZE` bytes, it is split across consecutive drawers so nothing is
+/// silently discarded (fixes the prior 8-line cap).
 fn chunk_by_exchange(lines: &[&str]) -> Vec<Chunk> {
     let mut chunks = Vec::new();
     let mut i = 0;
@@ -154,14 +200,51 @@ fn chunk_by_exchange(lines: &[&str]) -> Vec<Chunk> {
                 i += 1;
             }
 
-            let ai_response = ai_lines[..ai_lines.len().min(8)].join(" ");
+            // Full response — no truncation.
+            let ai_response = ai_lines.join(" ");
             let content = if ai_response.is_empty() {
                 user_turn.to_string()
             } else {
                 format!("{user_turn}\n{ai_response}")
             };
 
-            if content.trim().len() > MIN_CHUNK_SIZE {
+            if content.len() > CHUNK_SIZE {
+                // First chunk: user turn + as much response as fits.
+                // Use char-boundary-safe slicing: a raw byte offset can land
+                // mid-codepoint for multi-byte chars (emoji, CJK, accents).
+                let first_end = chunk_by_exchange_floor_char_boundary(&content, CHUNK_SIZE);
+                let first = &content[..first_end];
+                // Guard first chunk to avoid nearly-empty starts.
+                if first.trim().len() > MIN_CHUNK_SIZE {
+                    chunks.push(Chunk {
+                        content: first.to_string(),
+                        chunk_index: chunks.len(),
+                    });
+                }
+                // Remaining response in CHUNK_SIZE continuation drawers.
+                // Continuation fragments are always pushed (no MIN_CHUNK_SIZE filter)
+                // to prevent silent data loss once we've committed to multi-chunk output.
+                let mut remainder = &content[first_end..];
+                while !remainder.is_empty() {
+                    let end = chunk_by_exchange_floor_char_boundary(remainder, CHUNK_SIZE);
+                    // If floor_char_boundary returned 0 (edge case for corrupted input),
+                    // advance by the first character's UTF-8 byte length to maintain
+                    // boundary safety and prevent infinite loops.
+                    let end = if end == 0 {
+                        // Invariant: remainder is non-empty (guarded by while condition),
+                        // so chars().next() always returns Some.
+                        remainder.chars().next().map_or(1, char::len_utf8)
+                    } else {
+                        end
+                    };
+                    let part = &remainder[..end];
+                    remainder = &remainder[end..];
+                    chunks.push(Chunk {
+                        content: part.to_string(),
+                        chunk_index: chunks.len(),
+                    });
+                }
+            } else if content.trim().len() > MIN_CHUNK_SIZE {
                 chunks.push(Chunk {
                     content,
                     chunk_index: chunks.len(),
@@ -544,5 +627,165 @@ mod tests {
     fn detect_convo_room_handles_utf8_without_panicking() {
         let content = "🚀 Planejamento técnico com decisão sobre API e arquitetura. ".repeat(200);
         assert_eq!(detect_convo_room(&content), "technical");
+    }
+
+    #[test]
+    fn chunk_by_exchange_stores_full_ai_response() {
+        // Before the fix the AI response was truncated to 8 lines; this test
+        // verifies the 9th line is now preserved.
+        let lines: Vec<String> = std::iter::once("> user question".to_string())
+            .chain((1..=9).map(|n| format!("ai line {n}")))
+            .collect();
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let chunks = chunk_by_exchange(&refs);
+        assert!(!chunks.is_empty(), "must produce at least one chunk");
+        let all_text = chunks
+            .iter()
+            .map(|c| c.content.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            all_text.contains("ai line 9"),
+            "9th AI line must be preserved"
+        );
+    }
+
+    #[test]
+    fn chunk_by_exchange_splits_large_exchange() {
+        // A long AI response (> CHUNK_SIZE) must be split into multiple drawers.
+        let ai_body = "x ".repeat(500); // ~1000 chars > CHUNK_SIZE=800
+        let input = format!("> user turn\n{ai_body}");
+        let lines: Vec<&str> = input.lines().collect();
+        let chunks = chunk_by_exchange(&lines);
+        assert!(chunks.len() >= 2, "large exchange must produce 2+ chunks");
+        // Chunk indices must be contiguous and 0-based.
+        for (expected, chunk) in chunks.iter().enumerate() {
+            assert_eq!(chunk.chunk_index, expected, "chunk indices must be 0-based");
+        }
+    }
+
+    #[test]
+    fn chunk_by_exchange_small_exchange_single_chunk() {
+        // Content is > MIN_CHUNK_SIZE (30) so it must produce exactly one chunk.
+        let input = "> user asks a question here\nthe assistant replies with an answer";
+        let lines: Vec<&str> = input.lines().collect();
+        let chunks = chunk_by_exchange(&lines);
+        assert_eq!(chunks.len(), 1, "small exchange fits in one chunk");
+        assert!(
+            chunks[0].content.contains("assistant replies"),
+            "answer preserved"
+        );
+    }
+
+    #[test]
+    fn chunk_by_exchange_multibyte_chars_no_panic() {
+        // Emoji and accented chars are multi-byte; a raw byte slice at CHUNK_SIZE
+        // could land mid-codepoint and panic.  This test verifies the split is
+        // UTF-8-boundary-safe and all content is preserved across chunks.
+        let emoji_line = "🚀".repeat(300); // 300 × 4 bytes = 1200 bytes, well above CHUNK_SIZE
+        let input = format!("> question\n{emoji_line}");
+        let lines: Vec<&str> = input.lines().collect();
+        // Must not panic and must produce valid UTF-8 in every chunk.
+        let chunks = chunk_by_exchange(&lines);
+        assert!(!chunks.is_empty(), "must produce at least one chunk");
+        for chunk in &chunks {
+            assert!(
+                std::str::from_utf8(chunk.content.as_bytes()).is_ok(),
+                "every chunk must be valid UTF-8"
+            );
+        }
+        // Round-trip validation: reconstruct original from chunks and verify bytes match.
+        let reconstructed = chunks
+            .iter()
+            .map(|c| c.content.as_str())
+            .collect::<String>();
+        assert_eq!(
+            reconstructed.as_bytes(),
+            input.as_bytes(),
+            "reconstructed content must match original bytes exactly"
+        );
+    }
+
+    #[test]
+    fn chunk_by_exchange_floor_char_boundary_ascii() {
+        // ASCII strings: every byte is a char boundary, so result == index.
+        assert_eq!(chunk_by_exchange_floor_char_boundary("hello", 3), 3);
+        assert_eq!(chunk_by_exchange_floor_char_boundary("hello", 10), 5); // clamped to len
+    }
+
+    #[test]
+    fn chunk_by_exchange_floor_char_boundary_multibyte() {
+        // "é" is 2 bytes (0xC3 0xA9); byte 1 is mid-codepoint.
+        let s = "aé"; // bytes: [0x61, 0xC3, 0xA9]
+        assert_eq!(chunk_by_exchange_floor_char_boundary(s, 2), 1); // step back to 'a' boundary
+        assert_eq!(chunk_by_exchange_floor_char_boundary(s, 3), 3); // end of 'é' is fine
+    }
+
+    #[test]
+    fn chunk_by_exchange_small_tail_regression() {
+        // Regression test: tail chunk smaller than MIN_CHUNK_SIZE is preserved.
+        // Total size = CHUNK_SIZE + (MIN_CHUNK_SIZE - 1) - prefix_len so remainder
+        // after first CHUNK_SIZE bytes is strictly < MIN_CHUNK_SIZE.
+        let prefix_len = "> user\n".len(); // 7 bytes
+        let ai_body = "x".repeat(CHUNK_SIZE + (MIN_CHUNK_SIZE - 1) - prefix_len); // 822 bytes
+        let input = format!("> user\n{ai_body}");
+        let lines: Vec<&str> = input.lines().collect();
+
+        let chunks = chunk_by_exchange(&lines);
+
+        // Must produce exactly two chunks: one full (800) and one tail (< 30).
+        assert_eq!(chunks.len(), 2, "must produce exactly two chunks");
+
+        // Chunk indices must be contiguous and 0-based.
+        for (expected, chunk) in chunks.iter().enumerate() {
+            assert_eq!(
+                chunk.chunk_index, expected,
+                "chunk indices must be 0-based and contiguous"
+            );
+        }
+
+        // Full byte reconstruction: concatenate all chunk bodies.
+        let reconstructed = chunks
+            .iter()
+            .map(|c| c.content.as_str())
+            .collect::<String>();
+        assert_eq!(
+            reconstructed.as_bytes(),
+            input.as_bytes(),
+            "reconstructed content must match original bytes exactly"
+        );
+    }
+
+    #[test]
+    fn chunk_exchanges_single_exchange_regression() {
+        // Regression: chunk_exchanges must route single-exchange transcripts
+        // through chunk_by_exchange, preserving all AI lines.  An earlier
+        // threshold of quote_count >= 3 caused single-exchange blocks to fall
+        // through to chunk_by_paragraph, silently dropping lines beyond the
+        // first paragraph boundary.  This test calls the public dispatcher
+        // (chunk_exchanges) rather than chunk_by_exchange directly so any future
+        // regression in the routing logic is caught here.
+        let lines: Vec<String> = std::iter::once("> user question".to_string())
+            .chain((1..=9).map(|n| format!("ai line {n}")))
+            .collect();
+        let input = lines.join("\n");
+        let chunks = chunk_exchanges(&input);
+        assert!(!chunks.is_empty(), "must produce at least one chunk");
+        let all_text = chunks
+            .iter()
+            .map(|c| c.content.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            all_text.contains("ai line 9"),
+            "all AI lines must be preserved via chunk_exchanges dispatcher"
+        );
+        // Chunk indices must be contiguous and 0-based.
+        for (expected, chunk) in chunks.iter().enumerate() {
+            assert_eq!(
+                chunk.chunk_index, expected,
+                "chunk indices must be 0-based and contiguous"
+            );
+        }
     }
 }

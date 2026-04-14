@@ -18,6 +18,15 @@ use super::protocol::{AAAK_SPEC, PALACE_PROTOCOL};
 /// Values above this lose precision when stored in f64, so we reject them.
 const MAX_EXACT_INT_F64: f64 = 9_007_199_254_740_991.0;
 
+/// Maximum byte length for a tunnel label.  Labels are free-form strings stored
+/// in `SQLite`; without a cap an unbounded value could waste DB space or overflow
+/// index rows.  255 characters is generous for a short descriptive label.
+const MAX_LABEL_LEN: usize = 255;
+
+/// Exact character length of a tunnel ID.  Tunnel IDs are the first 16 hex
+/// characters of a SHA256 digest (see `canonical_tunnel_id` in graph.rs).
+const TUNNEL_ID_LEN: usize = 16;
+
 /// Dispatch a tool call by name and return the JSON result.
 pub async fn dispatch(connection: &Connection, name: &str, args: &Value) -> Value {
     // Empty name and non-object args can arrive from untrusted MCP clients;
@@ -50,6 +59,10 @@ pub async fn dispatch(connection: &Connection, name: &str, args: &Value) -> Valu
         "mempalace_traverse" => tool_traverse(connection, args).await,
         "mempalace_find_tunnels" => tool_find_tunnels(connection, args).await,
         "mempalace_graph_stats" => tool_graph_stats(connection).await,
+        "mempalace_create_tunnel" => tool_create_tunnel(connection, args).await,
+        "mempalace_list_tunnels" => tool_list_tunnels(connection, args).await,
+        "mempalace_delete_tunnel" => tool_delete_tunnel(connection, args).await,
+        "mempalace_follow_tunnels" => tool_follow_tunnels(connection, args).await,
         "mempalace_diary_write" => tool_diary_write(connection, args).await,
         "mempalace_diary_read" => tool_diary_read(connection, args).await,
         _ => json!({"error": format!("Unknown tool: {name}"), "public": true}),
@@ -166,6 +179,35 @@ fn sanitize_opt_name(value: &str, field_name: &str) -> Result<Option<String>, Va
         return Ok(None);
     }
     sanitize_name(value, field_name).map(Some)
+}
+
+/// Validate tunnel label: trim, non-empty, reject null bytes and length violations.
+fn sanitize_label(value: &str) -> Result<String, Value> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(
+            json!({"success": false, "error": "label must be a non-empty string", "public": true}),
+        );
+    }
+    if trimmed.len() > MAX_LABEL_LEN {
+        return Err(
+            json!({"success": false, "error": format!("label exceeds maximum length of {MAX_LABEL_LEN} characters"), "public": true}),
+        );
+    }
+    if trimmed.contains('\0') {
+        return Err(
+            json!({"success": false, "error": "label contains null bytes", "public": true}),
+        );
+    }
+    let result = trimmed.to_string();
+
+    // Postconditions: result is non-empty, trimmed, and safe.
+    debug_assert!(!result.is_empty());
+    debug_assert!(result == result.trim());
+    debug_assert!(!result.contains('\0'));
+    debug_assert!(result.len() <= MAX_LABEL_LEN);
+
+    Ok(result)
 }
 
 /// Validate drawer/diary content.  Returns `Ok(trimmed)` if valid, or `Err(error_json)` if not.
@@ -1110,6 +1152,121 @@ async fn tool_find_tunnels(connection: &Connection, args: &Value) -> Value {
 async fn tool_graph_stats(connection: &Connection) -> Value {
     match graph::graph_stats(connection).await {
         Ok(stats) => json!(stats),
+        Err(e) => json!({"error": e.to_string()}),
+    }
+}
+
+async fn tool_create_tunnel(connection: &Connection, args: &Value) -> Value {
+    let source_wing = match sanitize_name(str_arg(args, "source_wing"), "source_wing") {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let source_room = match sanitize_name(str_arg(args, "source_room"), "source_room") {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let target_wing = match sanitize_name(str_arg(args, "target_wing"), "target_wing") {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let target_room = match sanitize_name(str_arg(args, "target_room"), "target_room") {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let label = match sanitize_label(str_arg(args, "label")) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let source_drawer_id =
+        match sanitize_opt_name(str_arg(args, "source_drawer_id"), "source_drawer_id") {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+    let target_drawer_id =
+        match sanitize_opt_name(str_arg(args, "target_drawer_id"), "target_drawer_id") {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+
+    match graph::create_tunnel(
+        connection,
+        &graph::CreateTunnelParams {
+            source_wing: &source_wing,
+            source_room: &source_room,
+            target_wing: &target_wing,
+            target_room: &target_room,
+            label: &label,
+            source_drawer_id: source_drawer_id.as_deref(),
+            target_drawer_id: target_drawer_id.as_deref(),
+        },
+    )
+    .await
+    {
+        Ok(tunnel) => {
+            wal_log(
+                "create_tunnel",
+                json!({
+                    "tunnel_id": tunnel.id,
+                    "source_wing": tunnel.source_wing,
+                    "source_room": tunnel.source_room,
+                    "target_wing": tunnel.target_wing,
+                    "target_room": tunnel.target_room,
+                    "label": tunnel.label,
+                    "source_drawer_id": tunnel.source_drawer_id,
+                    "target_drawer_id": tunnel.target_drawer_id,
+                }),
+            )
+            .await;
+            json!(tunnel)
+        }
+        Err(e) => json!({"error": e.to_string()}),
+    }
+}
+
+async fn tool_list_tunnels(connection: &Connection, args: &Value) -> Value {
+    let wing = match sanitize_opt_name(str_arg(args, "wing"), "wing") {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+
+    match graph::list_tunnels(connection, wing.as_deref()).await {
+        Ok(tunnels) => json!({"tunnels": tunnels, "count": tunnels.len()}),
+        Err(e) => json!({"error": e.to_string()}),
+    }
+}
+
+async fn tool_delete_tunnel(connection: &Connection, args: &Value) -> Value {
+    // Trim before validation to avoid spurious failures from surrounding whitespace.
+    let tunnel_id = str_arg(args, "tunnel_id").trim();
+    if tunnel_id.is_empty() {
+        return json!({"error": "tunnel_id is required", "public": true});
+    }
+    // Tunnel IDs are the first 16 hex characters of a SHA256 digest — validate
+    // the exact format so arbitrary strings are never passed to the database.
+    if tunnel_id.len() != TUNNEL_ID_LEN || !tunnel_id.chars().all(|c| c.is_ascii_hexdigit()) {
+        return json!({"error": "tunnel_id must be a 16-character hex string", "public": true});
+    }
+
+    wal_log("delete_tunnel", json!({"tunnel_id": tunnel_id})).await;
+
+    match graph::delete_tunnel(connection, tunnel_id).await {
+        Ok(deleted) => json!({"deleted": deleted, "tunnel_id": tunnel_id}),
+        Err(e) => json!({"error": e.to_string()}),
+    }
+}
+
+async fn tool_follow_tunnels(connection: &Connection, args: &Value) -> Value {
+    let wing = match sanitize_name(str_arg(args, "wing"), "wing") {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let room = match sanitize_name(str_arg(args, "room"), "room") {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+
+    match graph::follow_tunnels(connection, &wing, &room).await {
+        Ok(connections) => json!({"wing": wing, "room": room, "connections": connections}),
         Err(e) => json!({"error": e.to_string()}),
     }
 }
